@@ -29,7 +29,7 @@ FROM alpine
 # 添加 git 和 curl
 RUN apk update \
     && apk upgrade \
-    && apk add --no-cache ca-certificates tzdata ffmpeg curl git \
+    && apk add --no-cache ca-certificates tzdata ffmpeg bash curl git coreutils \
     && update-ca-certificates \
     && rm -rf /var/cache/apk/*
 
