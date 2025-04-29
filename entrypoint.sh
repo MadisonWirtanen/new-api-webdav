@@ -1,281 +1,200 @@
 #!/bin/bash
 
-# 数据库文件名和备份文件名前缀
-DB_FILENAME="one-api.db"
-BACKUP_PREFIX="one_api_backup_"
-# 数据目录（容器内绝对路径）
-DATA_DIR="/data"
-# 数据库文件完整路径
-DB_FILE_PATH="${DATA_DIR}/${DB_FILENAME}"
-# 临时文件目录
-TMP_DIR="/tmp"
+# 定义常量和变量
+DB_FILE="./data/one-api.db"               # 数据库文件路径
+DB_SUM_FILE="${DB_FILE}.sha256"           # 数据库校验和文件路径
+DB_SUM_NEW_FILE="${DB_SUM_FILE}.new"      # 新生成的校验和临时文件路径
+BACKUP_FILENAME_PREFIX="one-api"          # 备份文件名前缀
+BACKUP_FILE_EXTENSION="db"                # 备份文件扩展名
+DATA_DIR="./data"                         # 数据目录
+TEMP_DIR_PREFIX="sync_temp_"              # 临时目录前缀
 
-# 检查 WebDAV 环境变量，如果缺少则只启动主程序
-if [[ -z "$WEBDAV_URL" ]] || [[ -z "$WEBDAV_USERNAME" ]] || [[ -z "$WEBDAV_PASSWORD" ]]; then
-    echo "缺少 WEBDAV_URL、WEBDAV_USERNAME 或 WEBDAV_PASSWORD 环境变量，启动时不启用备份/恢复功能。"
+# 确保数据目录存在
+mkdir -p "$DATA_DIR"
+# 切换到工作目录，确保所有相对路径正确
+cd "$DATA_DIR" || exit 1
 
-else
-    echo "检测到 WebDAV 配置，启用备份/恢复功能。"
+# --- 函数定义 ---
 
-    # 处理可选的备份子目录路径
-    WEBDAV_BACKUP_PATH=${WEBDAV_BACKUP_PATH:-""}
-    # 确保基础 URL 没有尾部斜杠
-    WEBDAV_URL_BASE=${WEBDAV_URL%/}
-    FULL_WEBDAV_URL="${WEBDAV_URL_BASE}"
-    if [ -n "$WEBDAV_BACKUP_PATH" ]; then
-        # 确保子目录路径没有前导斜杠
-        WEBDAV_BACKUP_PATH_CLEAN=${WEBDAV_BACKUP_PATH#/}
-        FULL_WEBDAV_URL="${WEBDAV_URL_BASE}/${WEBDAV_BACKUP_PATH_CLEAN}"
+# 生成校验和文件
+generate_sum() {
+    local file=$1
+    local sum_file=$2
+    # 确保文件存在才生成校验和
+    if [ -f "$file" ]; then
+        sha256sum "$file" > "$sum_file"
+        return 0
+    else
+        return 1
     fi
-    echo "WebDAV 完整路径: ${FULL_WEBDAV_URL}"
-
-    # 下载最新备份并恢复函数
-    restore_backup() {
-        echo "开始尝试从 WebDAV 下载并恢复最新备份..."
-        # 使用唯一的临时目录名，避免潜在冲突
-        local restore_tmp_dir="${TMP_DIR}/restore_$$"
-        python3 -c "
-import sys
-import os
-import tarfile
-import requests
-from webdav3.client import Client
-import shutil
-
-# 从环境变量获取配置
-webdav_url = '$FULL_WEBDAV_URL'
-webdav_user = '$WEBDAV_USERNAME'
-webdav_pass = '$WEBDAV_PASSWORD'
-db_filename = '$DB_FILENAME'
-backup_prefix = '$BACKUP_PREFIX'
-local_db_path = '$DB_FILE_PATH' # 恢复的目标路径
-tmp_dir = '$restore_tmp_dir' # 使用传入的唯一临时解压目录
-tmp_download_dir = '$TMP_DIR' # 下载文件存放目录
-
-options = {
-    'webdav_hostname': webdav_url,
-    'webdav_login': webdav_user,
-    'webdav_password': webdav_pass,
 }
 
-try:
-    client = Client(options)
-    print(f'尝试列出 WebDAV 目录 {webdav_url} 中的内容...')
-
-    # 列出 WebDAV 目录中的所有文件/目录
-    remote_items = client.list()
-
-    # 筛选出符合条件的备份文件
-    backups = []
-    for item_path in remote_items:
-         basename = os.path.basename(item_path.rstrip('/'))
-         if basename.endswith('.tar.gz') and basename.startswith(backup_prefix):
-             backups.append(item_path)
-
-    if not backups:
-        print('在 WebDAV 上没有找到符合条件的备份文件，跳过恢复。')
-        sys.exit(0)
-
-    backups.sort()
-    latest_backup_path = backups[-1]
-    latest_backup_basename = os.path.basename(latest_backup_path.rstrip('/'))
-    print(f'找到最新备份文件路径: {latest_backup_path} (文件名: {latest_backup_basename})')
-
-    download_url = options['webdav_hostname'].rstrip('/') + '/' + latest_backup_path.lstrip('/')
-    local_tmp_download_path = os.path.join(tmp_download_dir, latest_backup_basename)
-
-    print(f'开始下载: {download_url} -> {local_tmp_download_path}')
-    try:
-        with requests.get(download_url, auth=(options['webdav_login'], options['webdav_password']), stream=True, timeout=300) as r:
-            r.raise_for_status()
-            with open(local_tmp_download_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f'成功下载备份文件到 {local_tmp_download_path}')
-    except requests.exceptions.RequestException as download_err:
-         print(f'下载备份文件时出错: {download_err}')
-         if os.path.exists(local_tmp_download_path):
-             os.remove(local_tmp_download_path)
-         sys.exit(1)
-
-    if os.path.exists(local_tmp_download_path):
-        try:
-            os.makedirs(tmp_dir, exist_ok=True)
-            print(f'开始解压 {local_tmp_download_path} 到 {tmp_dir}')
-            with tarfile.open(local_tmp_download_path, 'r:gz') as tar:
-                def is_within_directory(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
-                    return prefix == abs_directory
-
-                for member in tar.getmembers():
-                    member_path = os.path.join(tmp_dir, member.name)
-                    if not is_within_directory(tmp_dir, member_path):
-                        raise Exception(f'检测到不安全的解压路径: {member.name}')
-                tar.extractall(path=tmp_dir)
-
-            extracted_db_path = os.path.join(tmp_dir, db_filename)
-            if os.path.isfile(extracted_db_path):
-                print(f'在解压目录中找到 {db_filename}')
-                os.makedirs(os.path.dirname(local_db_path), exist_ok=True)
-                shutil.move(extracted_db_path, local_db_path)
-                print(f'成功从 {latest_backup_basename} 恢复 {db_filename} 到 {local_db_path}')
-            else:
-                print(f'错误：在解压后的备份文件 {tmp_dir} 中未找到 {db_filename}。')
-
-        except (tarfile.TarError, OSError, Exception) as extract_err:
-             print(f'解压或恢复数据库时出错: {extract_err}')
-        finally:
-            print(f'清理临时下载文件: {local_tmp_download_path}')
-            os.remove(local_tmp_download_path)
-            if os.path.exists(tmp_dir):
-                 print(f'清理临时解压目录: {tmp_dir}')
-                 shutil.rmtree(tmp_dir)
-    else:
-        print(f'错误：下载的备份文件 {local_tmp_download_path} 未找到 (可能下载失败后被清理)。')
-
-except Exception as e:
-    print(f'执行恢复备份过程中发生意外错误: {e}')
-    if 'local_tmp_download_path' in locals() and os.path.exists(local_tmp_download_path):
-        os.remove(local_tmp_download_path)
-    if 'tmp_dir' in locals() and os.path.exists(tmp_dir):
-        shutil.rmtree(tmp_dir)
-"
-        if [ $? -ne 0 ]; then
-             echo "警告：恢复备份脚本执行失败。"
+# --- 启动时数据恢复逻辑 ---
+echo "容器启动，检查数据恢复..."
+if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then
+    echo "尝试从WebDAV恢复 ${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}..."
+    # 下载到当前目录 (.) 即 /data
+    curl -L --fail --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}" -o "./${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}" && {
+        echo "从WebDAV恢复数据成功"
+    } || {
+        echo "从WebDAV恢复失败或文件不存在。"
+        if [ ! -z "$G_NAME" ] && [ ! -z "$G_TOKEN" ]; then
+            echo "尝试从GitHub恢复 ${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}..."
+            REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"
+            # 创建一个唯一的临时克隆目录
+            TEMP_CLONE_DIR=$(mktemp -d -p "$(pwd)" "${TEMP_DIR_PREFIX}XXXXXX")
+            if git clone --depth 1 "$REPO_URL" "$TEMP_CLONE_DIR"; then
+                if [ -f "${TEMP_CLONE_DIR}/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}" ]; then
+                    # 从临时目录移动恢复的文件到当前目录 (/data)
+                    mv "${TEMP_CLONE_DIR}/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}" "./${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"
+                    echo "从GitHub仓库恢复成功"
+                else
+                    echo "GitHub仓库中未找到 ${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"
+                fi
+                # 清理临时目录
+                rm -rf "$TEMP_CLONE_DIR"
+            else
+                echo "GitHub克隆失败"
+                # 清理失败的临时目录
+                rm -rf "$TEMP_CLONE_DIR"
+            fi
+        else
+            echo "未配置GitHub, 跳过GitHub恢复"
         fi
     }
+else
+    echo "未配置WebDAV, 跳过数据恢复"
+fi
+echo "数据恢复检查完成。"
 
-    # 首次启动时尝试恢复最新备份
-    restore_backup
+# --- 后台同步函数 ---
+sync_data() {
+    echo "启动后台数据同步循环..."
+    while true; do
+        echo "[同步检查] 开始检查 ${DB_FILE}..."
+        # DB_FILE 需要相对于当前目录（/data）
+        local current_db_file="./${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"
+        local current_sum_file="${current_db_file}.sha256"
+        local current_sum_new_file="${current_sum_file}.new"
 
-    # 后台定期同步函数
-    sync_data() {
-        local keep_latest_backups=7 # 保留最新的备份数量
+        if [ -f "$current_db_file" ]; then
+            # 生成新的校验和
+            generate_sum "$current_db_file" "$current_sum_new_file"
 
-        while true; do
-            SYNC_INTERVAL=${SYNC_INTERVAL:-600}
-            echo "同步检查开始: $(date)"
+            # 检查文件是否变化 (校验和文件不存在或内容不同)
+            if [ ! -f "$current_sum_file" ] || ! cmp -s "$current_sum_new_file" "$current_sum_file"; then
+                echo "[同步] 检测到 ${current_db_file} 文件变化，开始同步..."
 
-            if [ -f "$DB_FILE_PATH" ]; then
-                timestamp=$(date +%Y%m%d_%H%M%S)
-                backup_basename="${BACKUP_PREFIX}${timestamp}.tar.gz"
-                local_tmp_backup_path="${TMP_DIR}/${backup_basename}"
+                # 同步到WebDAV (如果配置了)
+                if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then
+                    echo "[同步] 上传 ${current_db_file} 到 WebDAV..."
+                    # 使用 curl 上传当前目录下的文件
+                    if curl -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"; then
+                        echo "[同步] WebDAV更新成功"
+                        # 更新校验和文件
+                        mv "$current_sum_new_file" "$current_sum_file"
 
-                echo "找到数据库文件: ${DB_FILE_PATH}"
-                echo "创建本地临时备份: ${local_tmp_backup_path}"
-                if tar -czf "${local_tmp_backup_path}" -C "${DATA_DIR}" "${DB_FILENAME}"; then
-                    echo "本地临时备份创建成功。"
-                else
-                     echo "错误：创建 tar 压缩文件失败。"
-                     echo "下次同步检查将在 ${SYNC_INTERVAL} 秒后进行..."
-                     sleep $SYNC_INTERVAL
-                     continue
-                fi
+                        # 检查是否需要每日备份 (每天0点)
+                        local HOUR=$(date +%H)
+                        if [ "$HOUR" = "00" ]; then
+                            echo "[同步] 开始每日备份 (0点)..."
+                            local YESTERDAY=$(date -d "yesterday" '+%Y%m%d')
+                            local FILENAME_DAILY="${BACKUP_FILENAME_PREFIX}_${YESTERDAY}.${BACKUP_FILE_EXTENSION}"
 
-                echo "准备上传备份: ${backup_basename}"
-                upload_url="${FULL_WEBDAV_URL%/}/${backup_basename}"
-                echo "上传至: ${upload_url}"
-                curl_output=$(curl -u "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" -T "${local_tmp_backup_path}" "${upload_url}" --fail -sS --connect-timeout 10 --max-time 300 2>&1)
-                upload_status=$?
+                            # WebDAV 每日备份
+                            echo "[同步] 备份 ${FILENAME_DAILY} 到 WebDAV..."
+                            if curl -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME_DAILY"; then
+                                echo "[同步] WebDAV日期备份成功: $FILENAME_DAILY"
 
-                if [ ${upload_status} -eq 0 ]; then
-                    echo "成功将 ${backup_basename} 上传至 WebDAV"
-                else
-                    echo "上传 ${backup_basename} 至 WebDAV 失败 (curl 退出码: ${upload_status})。错误信息: ${curl_output}"
-                fi
+                                # GitHub 每日备份 (如果配置了)
+                                if [ ! -z "$G_NAME" ] && [ ! -z "$G_TOKEN" ]; then
+                                    echo "[同步] 开始GitHub每日备份..."
+                                    local REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"
+                                    # 在当前目录(/data)下创建临时目录
+                                    local TEMP_CLONE_DIR=$(mktemp -d -p "$(pwd)" "${TEMP_DIR_PREFIX}XXXXXX")
+                                    if git clone --depth 1 "$REPO_URL" "$TEMP_CLONE_DIR"; then
+                                        # 进入临时目录进行 git 操作
+                                        ( # 使用子shell确保操作后能返回原目录
+                                            cd "$TEMP_CLONE_DIR" || exit 1
+                                            git config user.name "AutoSync Bot"
+                                            git config user.email "autosync@bot.com"
+                                            # 确定默认分支名 (main 或 master)
+                                            local MAIN_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@')
+                                            git checkout "$MAIN_BRANCH"
+                                            # 从父目录(/data)复制当前数据库文件到仓库
+                                            cp "../${current_db_file}" "./${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"
 
-                echo "开始清理 WebDAV 上的旧备份 (保留最新的 ${keep_latest_backups} 个)..."
-                python3 -c "
-import sys
-import os
-from webdav3.client import Client
-import traceback
+                                            # 检查是否有变动需要提交
+                                            if [[ -n $(git status -s) ]]; then
+                                                git add "${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"
+                                                git commit -m "Auto sync ${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION} for ${YESTERDAY}"
+                                                if git push origin HEAD; then
+                                                    echo "[同步] GitHub推送成功"
+                                                else
+                                                    echo "[同步] GitHub推送失败"
+                                                fi
+                                            else
+                                                echo "[同步] GitHub: 无数据变化，无需推送"
+                                            fi
+                                        ) # 子shell结束，返回 /data 目录
+                                        # 清理临时目录
+                                        rm -rf "$TEMP_CLONE_DIR"
+                                    else # git clone failed
+                                        echo "[同步] GitHub克隆失败 (用于每日备份)"
+                                        rm -rf "$TEMP_CLONE_DIR"
+                                    fi
+                                fi # end github backup check
+                            else # webdav daily backup failed
+                                echo "[同步] WebDAV日期备份失败: $FILENAME_DAILY"
+                            fi # end webdav daily backup check
+                        fi # end daily backup time check
+                    else # webdav upload failed
+                        echo "[同步] WebDAV上传失败, 尝试重试..."
+                        sleep 10
+                        if curl -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"; then
+                            echo "[同步] WebDAV重试更新成功"
+                            # 更新校验和文件
+                            mv "$current_sum_new_file" "$current_sum_file"
+                        else
+                            echo "[同步] WebDAV重试失败"
+                            # 保留新的校验和文件供下次比较
+                            echo "[同步] 保留 ${current_sum_new_file} 用于下次检查"
+                        fi
+                    fi # end webdav upload attempt
+                else # webdav not configured
+                     echo "[同步] 未配置WebDAV，仅更新本地校验和文件"
+                     # 即使没有远程同步，也要更新校验和文件，以便下次能检测到变化
+                     mv "$current_sum_new_file" "$current_sum_file"
+                fi # end webdav config check
+            else # no change detected
+                echo "[同步检查] ${current_db_file} 文件未发生变化，跳过同步"
+                # 移除临时生成的新校验和文件
+                rm -f "$current_sum_new_file"
+            fi # end change detection
+        else # db file not found
+            echo "[同步检查] 未找到 ${current_db_file}, 跳过本次同步检查"
+        fi # end db file exists check
 
-webdav_url = '$FULL_WEBDAV_URL'
-webdav_user = '$WEBDAV_USERNAME'
-webdav_pass = '$WEBDAV_PASSWORD'
-backup_prefix = '$BACKUP_PREFIX'
-keep_latest = $keep_latest_backups
-
-options = {
-    'webdav_hostname': webdav_url,
-    'webdav_login': webdav_user,
-    'webdav_password': webdav_pass,
+        local current_time=$(date '+%Y-%m-%d %H:%M:%S')
+        local next_sync_time=$(date -d '+5 minutes' '+%Y-%m-%d %H:%M:%S')
+        echo "[同步检查] 当前时间: $current_time, 下次检查时间: $next_sync_time"
+        sleep 300 # 等待5分钟
+    done
 }
 
-try:
-    client = Client(options)
-    print(f'尝试列出 WebDAV 目录 {webdav_url} 以进行清理...')
-    remote_items = client.list()
+# --- 主逻辑 ---
 
-    backups_info = []
-    for item_path in remote_items:
-        if isinstance(item_path, str):
-            basename = os.path.basename(item_path.rstrip('/'))
-            if basename.endswith('.tar.gz') and basename.startswith(backup_prefix):
-                 backups_info.append({'basename': basename, 'path': item_path})
-        else:
-            print(f'警告: client.list() 返回了非字符串类型项: {item_path}')
+# 在后台启动同步循环
+sync_data &
 
-    if not backups_info:
-        print('未找到需要清理的备份文件。')
-        sys.exit(0)
+# 获取后台同步进程的PID
+SYNC_PID=$!
+echo "后台同步进程已启动 (PID: $SYNC_PID)"
 
-    backups_info.sort(key=lambda x: x['basename'])
-
-    print(f'找到 {len(backups_info)} 个符合条件的备份文件。')
-    if len(backups_info) > keep_latest:
-        to_delete_count = len(backups_info) - keep_latest
-        print(f'需要删除 {to_delete_count} 个旧备份。')
-        files_to_delete_info = backups_info[:to_delete_count]
-        deleted_count = 0
-        for file_info in files_to_delete_info:
-            # *** 修改点：尝试使用 basename 而不是原始 path ***
-            file_basename_to_delete = file_info['basename']
-            try:
-                # 使用 basename 进行删除。库应该将其解析为相对于 webdav_hostname 的路径
-                print(f'准备删除 (使用 basename): {file_basename_to_delete}')
-                client.clean(file_basename_to_delete) # <--- USE BASENAME
-                print(f'成功删除旧备份: {file_basename_to_delete}')
-                deleted_count += 1
-            except Exception as delete_err:
-                print(f'删除旧备份 {file_basename_to_delete} 时出错: {type(delete_err).__name__}: {delete_err}')
-                # traceback.print_exc() # 取消注释以获得更详细的 Python 堆栈跟踪
-        print(f'实际删除 {deleted_count} 个旧备份。')
-    else:
-        print(f'备份数量 ({len(backups_info)}) 未超过限制 ({keep_latest})，无需清理。')
-
-except Exception as e:
-    print(f'清理旧备份时发生意外错误: {type(e).__name__}: {e}')
-    # traceback.print_exc() # 取消注释以获得更详细的 Python 堆栈跟踪
-"
-                cleanup_status=$?
-                if [ ${cleanup_status} -ne 0 ]; then
-                    echo "警告：清理旧备份的 Python 脚本执行失败。"
-                fi
-
-                echo "清理本地临时备份文件: ${local_tmp_backup_path}"
-                rm -f "${local_tmp_backup_path}"
-            else
-                echo "数据库文件 ${DB_FILE_PATH} 不存在，跳过本次备份。"
-            fi
-
-            echo "下次同步检查将在 ${SYNC_INTERVAL} 秒后进行..."
-            sleep $SYNC_INTERVAL
-        done
-    }
-
-    echo "在后台启动定期备份进程..."
-    sync_data &
-    sync_pid=$!
-    echo "备份进程 PID: ${sync_pid}"
-
-fi
-
-echo "启动主程序: /one-api $@"
+# 使用 exec 启动主应用程序 (/one-api)
+# "$@" 会将传递给 entrypoint.sh 的所有参数原样传递给 /one-api
+echo "启动 one-api 主服务..."
 exec /one-api "$@"
 
-echo "如果看到此消息，则 exec /one-api 失败！"
-exit 1
+# exec 执行后，当前脚本进程被 one-api 进程替换
+# 当 one-api 退出时，容器将停止，后台的 sync_data 进程也会被终止
