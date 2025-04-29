@@ -152,7 +152,7 @@ except Exception as e:
 
     # 后台定期同步函数
     sync_data() {
-        local keep_latest_backups=5 # 保留最新的备份数量
+        local keep_latest_backups=15 # 保留最新的备份数量
 
         while true; do
             SYNC_INTERVAL=${SYNC_INTERVAL:-600}
