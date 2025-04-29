@@ -124,7 +124,7 @@ sync_data() {\n\
                                         else\n\
                                             echo "GitHub: 无数据变化"\n\
                                         fi\n\
-                                        cd ../..
+                                        cd ../..\n\
                                         rm -rf ./data/temp\n\
                                     fi\n\
                                 fi\n\
