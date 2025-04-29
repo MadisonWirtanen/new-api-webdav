@@ -24,7 +24,7 @@ COPY --from=builder /build/dist ./web/dist
 RUN go build -ldflags "-s -w -X 'one-api/common.Version=$(cat VERSION)'" -o one-api
 
 # 最终运行阶段
-FROM alpine:3.18 # 使用一个明确的稳定版本
+FROM alpine:3.18
 
 # 更新 Alpine 包索引并升级现有包
 RUN apk update && apk upgrade \
