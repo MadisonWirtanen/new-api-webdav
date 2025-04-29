@@ -1,82 +1,164 @@
-# 第一阶段：构建前端
 FROM oven/bun:latest AS builder
 WORKDIR /build
 COPY web/package.json .
 RUN bun install
 COPY ./web .
 COPY ./VERSION .
-# 构建 React 应用，并将版本信息注入
 RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat VERSION) bun run build
-
-# 第二阶段：构建 Go 后端
 FROM golang:alpine AS builder2
 ENV GO111MODULE=on \
     CGO_ENABLED=0 \
     GOOS=linux
 WORKDIR /build
 ADD go.mod go.sum ./
-# 下载 Go 模块依赖
 RUN go mod download
 COPY . .
-# 从第一阶段复制构建好的前端静态文件
 COPY --from=builder /build/dist ./web/dist
-# 编译 Go 应用，并注入版本信息
 RUN go build -ldflags "-s -w -X 'one-api/common.Version=$(cat VERSION)'" -o one-api
+FROM alpine
+RUN apk update \
+    && apk upgrade \
+    && apk add --no-cache ca-certificates tzdata ffmpeg bash curl git sha256sum \
+    && update-ca-certificates
 
-# 最终运行阶段
-FROM alpine:3.18
+COPY --from=builder2 /build/one-api /
 
-# 更新 Alpine 包索引并升级现有包
-RUN apk update && apk upgrade \
-    && echo "[Build Step] Alpine packages updated and upgraded successfully."
-
-# 安装运行 entrypoint.sh 和 one-api 所需的依赖
-# ca-certificates: HTTPS 证书支持
-# tzdata: 时区数据
-# ffmpeg: 原 Dockerfile 中包含，予以保留
-# bash: entrypoint.sh 使用 bash
-# python3, py3-pip: 运行 Python 备份/恢复/清理脚本
-# curl: 用于上传备份到 WebDAV
-# tar: 用于打包数据库文件
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
-    ffmpeg \
-    bash \
-    python3 \
-    py3-pip \
-    curl \
-    tar \
-    && echo "[Build Step] Essential APK packages installed successfully."
-
-# 更新系统 CA 证书
-RUN update-ca-certificates \
-    && echo "[Build Step] CA certificates updated successfully."
-
-# 安装 Python 依赖库 (requests 用于 HTTP 请求，webdavclient3 用于 WebDAV 操作)
-# 使用国内镜像源 (清华源) 加速下载并增加稳定性
-# --no-cache-dir: 不使用缓存，确保获取最新包并减少镜像层大小
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple requests webdavclient3 \
-    && echo "[Build Step] Python dependencies (requests, webdavclient3) installed successfully."
-
-# 清理 apk 缓存以减小最终镜像体积
-RUN rm -rf /var/cache/apk/* \
-    && echo "[Build Step] APK cache cleared."
-
-# 从 Go 构建阶段复制编译好的 one-api 二进制文件到根目录
-COPY --from=builder2 /build/one-api /one-api
-
-# 复制入口点脚本到镜像根目录
-COPY entrypoint.sh /entrypoint.sh
-# 赋予入口点脚本执行权限
-RUN chmod +x /entrypoint.sh
-
-# 设置工作目录为 /data，one-api 默认会在此目录下寻找或创建数据库文件
 WORKDIR /data
 
-# 暴露 one-api 服务端口
-EXPOSE 3000
+# 添加同步脚本
+RUN echo '#!/bin/bash\n\
+\n\
+mkdir -p ./data\n\
+\n\
+# 生成校验和文件\n\
+generate_sum() {\n\
+    local file=$1\n\
+    local sum_file=$2\n\
+    sha256sum "$file" > "$sum_file"\n\
+}\n\
+\n\
+# 优先从WebDAV恢复数据\n\
+if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then\n\
+    echo "尝试从WebDAV恢复数据..."\n\
+    curl -L --fail --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/one-api.db" -o "./data/one-api.db" && {\n\
+        echo "从WebDAV恢复数据成功"\n\
+    } || {\n\
+        if [ ! -z "$G_NAME" ] && [ ! -z "$G_TOKEN" ]; then\n\
+            echo "从WebDAV恢复失败,尝试从GitHub恢复..."\n\
+            REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"\n\
+            git clone "$REPO_URL" ./data/temp && {\n\
+                if [ -f ./data/temp/one-api.db ]; then\n\
+                    mv ./data/temp/one-api.db ./data/one-api.db\n\
+                    echo "从GitHub仓库恢复成功"\n\
+                    rm -rf ./data/temp\n\
+                else\n\
+                    echo "GitHub仓库中未找到one-api.db"\n\
+                    rm -rf ./data/temp\n\
+                fi\n\
+            }\n\
+        else\n\
+            echo "WebDAV恢复失败,且未配置GitHub"\n\
+        fi\n\
+    }\n\
+else\n\
+    echo "未配置WebDAV,跳过数据恢复"\n\
+fi\n\
+\n\
+# 同步函数\n\
+sync_data() {\n\
+    while true; do\n\
+        echo "开始同步..."\n\
+        HOUR=$(date +%H)\n\
+        \n\
+        if [ -f "./data/one-api.db" ]; then\n\
+            # 生成新的校验和文件\n\
+            generate_sum "./data/one-api.db" "./data/one-api.db.sha256.new"\n\
+            \n\
+            # 检查文件是否变化\n\
+            if [ ! -f "./data/one-api.db.sha256" ] || ! cmp -s "./data/one-api.db.sha256.new" "./data/one-api.db.sha256"; then\n\
+                echo "检测到文件变化，开始同步..."\n\
+                mv "./data/one-api.db.sha256.new" "./data/one-api.db.sha256"\n\
+                \n\
+                # 同步到WebDAV\n\
+                if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then\n\
+                    echo "同步到WebDAV..."\n\
+                    \n\
+                    # 上传数据文件\n\
+                    curl -L -T "./data/one-api.db" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/one-api.db" && {\n\
+                        echo "WebDAV更新成功"\n\
+                        \n\
+                        # 每日备份(包括WebDAV和GitHub)，在每天0点进行\n\
+                        if [ "$HOUR" = "00" ]; then\n\
+                            echo "开始每日备份..."\n\
+                            \n\
+                            # 获取前一天的日期\n\
+                            YESTERDAY=$(date -d "yesterday" \'+%Y%m%d\')\n\
+                            FILENAME_DAILY="one-api_${YESTERDAY}.db"\n\
+                            \n\
+                            # WebDAV每日备份\n\
+                            curl -L -T "./data/one-api.db" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME_DAILY" && {\n\
+                                echo "WebDAV日期备份成功: $FILENAME_DAILY"\n\
+                                \n\
+                                # GitHub每日备份\n\
+                                if [ ! -z "$G_NAME" ] && [ ! -z "$G_TOKEN" ]; then\n\
+                                    echo "开始GitHub每日备份..."\n\
+                                    REPO_URL="https://${G_TOKEN}@github.com/${G_NAME}.git"\n\
+                                    git clone "$REPO_URL" ./data/temp || {\n\
+                                        echo "GitHub克隆失败"\n\
+                                        rm -rf ./data/temp\n\
+                                    }\n\
+                                    \n\
+                                    if [ -d "./data/temp" ]; then\n\
+                                        cd ./data/temp\n\
+                                        git config user.name "AutoSync Bot"\n\
+                                        git config user.email "autosync@bot.com"\n\
+                                        git checkout main || git checkout master\n\
+                                        cp ../one-api.db ./one-api.db\n\
+                                        \n\
+                                        if [[ -n $(git status -s) ]]; then\n\
+                                            git add one-api.db\n\
+                                            git commit -m "Auto sync one-api.db for ${YESTERDAY}"\n\
+                                            git push origin HEAD && {\n\
+                                                echo "GitHub推送成功"\n\
+                                            } || echo "GitHub推送失败"\n\
+                                        else\n\
+                                            echo "GitHub: 无数据变化"\n\
+                                        fi\n\
+                                        cd ../..
+                                        rm -rf ./data/temp\n\
+                                    fi\n\
+                                fi\n\
+                            } || echo "WebDAV日期备份失败"\n\
+                        fi\n\
+                    } || {\n\
+                        echo "WebDAV上传失败,重试..."\n\
+                        sleep 10\n\
+                        curl -L -T "./data/one-api.db" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/one-api.db" || {\n\
+                            echo "WebDAV重试失败"\n\
+                        }\n\
+                    }\n\
+                fi\n\
+            else\n\
+                echo "文件未发生变化，跳过同步"\n\
+                rm -f "./data/one-api.db.sha256.new"\n\
+            fi\n\
+        else\n\
+            echo "未找到one-api.db,跳过同步"\n\
+        fi\n\
+        \n\
+        echo "当前时间: $(date \'+%Y-%m-%d %H:%M:%S\')"\n\
+        echo "下次同步: $(date -d \'+5 minutes\' \'+%Y-%m-%d %H:%M:%S\')"\n\
+        sleep 300\n\
+    done\n\
+}\n\
+\n\
+# 启动同步进程\n\
+sync_data &\n\
+\n\
+# 执行原始命令\n\
+exec "$@"' > /sync.sh
 
-# 设置容器启动时执行的命令为入口点脚本
-# 入口点脚本会先处理备份/恢复逻辑（如果配置了 WebDAV），然后启动 one-api 服务
-ENTRYPOINT ["/entrypoint.sh"]
+RUN chmod +x /sync.sh
+
+EXPOSE 3000
+ENTRYPOINT ["/bin/bash", "-c", "/sync.sh && /one-api"]
