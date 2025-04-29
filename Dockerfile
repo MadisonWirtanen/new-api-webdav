@@ -1,86 +1,61 @@
-# Stage 1: Build frontend
+# 第一阶段：构建前端
 FROM oven/bun:latest AS builder
 WORKDIR /build
 COPY web/package.json .
-# Use --frozen-lockfile for reproducible installs if lock file exists
-# Consider handling potential errors if lockfile is missing or out of sync
-RUN bun install --frozen-lockfile || bun install
+RUN bun install
 COPY ./web .
 COPY ./VERSION .
-# Ensure VERSION file exists and is readable
-RUN V_CONTENT=$(cat VERSION || echo "unknown") && \
-    echo "Building frontend with Version: $V_CONTENT" && \
-    DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION="$V_CONTENT" bun run build
+# 构建 React 应用，并将版本信息注入
+RUN DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat VERSION) bun run build
 
-# Stage 2: Build backend
-FROM golang:1.21-alpine AS builder2
-# Using a specific Go version like 1.21 for reproducibility
+# 第二阶段：构建 Go 后端
+FROM golang:alpine AS builder2
 ENV GO111MODULE=on \
     CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=amd64 # Specify architecture explicitly
+    GOOS=linux
 WORKDIR /build
-# Copy only necessary files for dependency download first to leverage Docker cache
-COPY go.mod go.sum ./
-RUN go mod download && go mod verify
-
-# Copy the rest of the source code
+ADD go.mod go.sum ./
+# 下载 Go 模块依赖
+RUN go mod download
 COPY . .
-
-# Copy built frontend from the first stage
+# 从第一阶段复制构建好的前端静态文件
 COPY --from=builder /build/dist ./web/dist
+# 编译 Go 应用，并注入版本信息
+RUN go build -ldflags "-s -w -X 'one-api/common.Version=$(cat VERSION)'" -o one-api
 
-# Build the Go application
-# Ensure VERSION file is available or provide a default
-COPY ./VERSION .
-RUN V_CONTENT=$(cat VERSION || echo "unknown") && \
-    echo "Building One API backend with Version: $V_CONTENT" && \
-    go build -ldflags="-s -w -X 'one-api/common.Version=$V_CONTENT'" -o one-api main.go # Assuming main.go is the entry point
-
-# Stage 3: Final image
-FROM alpine:latest
-
-# Add necessary runtime dependencies for one-api and the sync script
-# Group dependencies logically
+# 最终运行阶段
+FROM alpine
+# 安装必要的运行时依赖
+# ca-certificates: HTTPS 证书
+# tzdata: 时区信息
+# ffmpeg: 可能用于某些 API 功能（保留原样）
+# bash: 用于运行 entrypoint.sh 脚本
+# python3, py3-pip: 用于运行 Python 备份/恢复逻辑
+# curl: 用于上传备份到 WebDAV
+# tar: 用于打包备份文件
 RUN apk update \
     && apk upgrade \
-    && apk add --no-cache \
-        ca-certificates \
-        tzdata \
-        ffmpeg \
-        # Dependencies for entrypoint.sh and sync logic
-        bash \
-        curl \
-        python3 \
-        py3-pip \
-        tar \
+    && apk add --no-cache ca-certificates tzdata ffmpeg \
+                           bash python3 py3-pip curl tar \
     && update-ca-certificates \
-    # Install Python packages and clean up pip cache
-    && pip install --no-cache-dir requests webdav3.client \
-    # Clean up apk cache
+    # 安装 Python 库
+    && pip install requests webdavclient3 \
+    # 清理 apk 缓存减少镜像体积
     && rm -rf /var/cache/apk/*
 
-# Copy the built one-api executable from builder2
+# 从 Go 构建阶段复制编译好的二进制文件
 COPY --from=builder2 /build/one-api /one-api
 
-# Copy the entrypoint script (ensure this file exists in the build context)
+# 复制新的入口点脚本
 COPY entrypoint.sh /entrypoint.sh
-# Make the entrypoint script executable
+# 赋予入口点脚本执行权限
 RUN chmod +x /entrypoint.sh
 
-# Expose the application port defined by one-api
-EXPOSE 3000
-
-# Set the working directory where one-api expects its data (like one-api.db)
+# 设置工作目录
 WORKDIR /data
 
-# Optional: Add a basic healthcheck targeting a potential status endpoint of one-api
-# Adjust the CMD path as needed
-# HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-#   CMD curl -f http://localhost:3000/api/status || exit 1
+# 暴露应用程序端口
+EXPOSE 3000
 
-# Set the entrypoint to our wrapper script
+# 设置容器的入口点为新的脚本
 ENTRYPOINT ["/entrypoint.sh"]
-
-# Optional: Default command for the entrypoint (can be empty if entrypoint.sh handles everything)
-# CMD []

@@ -1,331 +1,314 @@
 #!/bin/bash
-set -e # Exit immediately if a command exits with a non-zero status.
 
-# --- Configuration ---
-DB_FILE_PATH="/data/one-api.db" # Absolute path to the database file
-BACKUP_PREFIX="oneapi_backup_" # Prefix for backup files
-TMP_DIR="/tmp" # Directory for temporary files
-CHECKSUM_FILE="${TMP_DIR}/oneapi_last_checksum" # File to store checksum of last backed up db
+# 数据库文件名和备份文件名前缀
+DB_FILENAME="one-api.db"
+BACKUP_PREFIX="one_api_backup_"
+# 数据目录（容器内绝对路径）
+DATA_DIR="/data"
+# 数据库文件完整路径
+DB_FILE_PATH="${DATA_DIR}/${DB_FILENAME}"
+# 临时文件目录
+TMP_DIR="/tmp"
 
-# --- WebDAV Sync Logic ---
-
-# Function to log messages
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - INFO - $1"
-}
-
-log_error() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR - $1" >&2
-}
-
-# Check if WebDAV is enabled via environment variables
+# 检查 WebDAV 环境变量，如果缺少则只启动主程序
 if [[ -z "$WEBDAV_URL" ]] || [[ -z "$WEBDAV_USERNAME" ]] || [[ -z "$WEBDAV_PASSWORD" ]]; then
-    log "WEBDAV_URL, WEBDAV_USERNAME, or WEBDAV_PASSWORD not set. Backup/restore functionality disabled."
-    WEBDAV_ENABLED=false
+    echo "缺少 WEBDAV_URL、WEBDAV_USERNAME 或 WEBDAV_PASSWORD 环境变量，启动时不启用备份/恢复功能。"
+
 else
-    log "WebDAV environment variables detected. Enabling backup/restore functionality."
-    WEBDAV_ENABLED=true
+    echo "检测到 WebDAV 配置，启用备份/恢复功能。"
 
-    # Sanitize and construct WebDAV URL
-    WEBDAV_URL=$(echo "$WEBDAV_URL" | sed 's:/*$::') # Remove trailing slashes from base URL
-    WEBDAV_BACKUP_PATH=${WEBDAV_BACKUP_PATH:-"oneapi_backups"} # Default backup sub-directory
-    WEBDAV_BACKUP_PATH=$(echo "$WEBDAV_BACKUP_PATH" | sed 's:^/*::' | sed 's:/*$::') # Remove surrounding slashes from path
-
+    # 处理可选的备份子目录路径
+    WEBDAV_BACKUP_PATH=${WEBDAV_BACKUP_PATH:-""}
+    # 确保基础 URL 没有尾部斜杠
+    WEBDAV_URL_BASE=${WEBDAV_URL%/}
+    FULL_WEBDAV_URL="${WEBDAV_URL_BASE}"
     if [ -n "$WEBDAV_BACKUP_PATH" ]; then
-        FULL_WEBDAV_URL="${WEBDAV_URL}/${WEBDAV_BACKUP_PATH}"
-        # Check and create backup directory on WebDAV server
-        log "Checking/Creating WebDAV backup directory: ${WEBDAV_BACKUP_PATH}"
-        python3 -c "
-import os, sys
-from webdav3.client import Client
-options = {
-    'webdav_hostname': '$WEBDAV_URL',
-    'webdav_login': '$WEBDAV_USERNAME',
-    'webdav_password': '$WEBDAV_PASSWORD',
-    'verify_ssl': os.environ.get('WEBDAV_VERIFY_SSL', 'true').lower() == 'true' # Control SSL verification
-}
-backup_dir = '$WEBDAV_BACKUP_PATH'
-try:
-    client = Client(options)
-    if not client.is_dir(backup_dir):
-        print(f'Directory {backup_dir} does not exist. Attempting to create...')
-        client.mkdir(backup_dir)
-        print(f'Successfully created directory {backup_dir}')
-    else:
-        print(f'Directory {backup_dir} already exists.')
-except Exception as e:
-    print(f'Error interacting with WebDAV directory {backup_dir}: {e}', file=sys.stderr)
-    # Decide if this error is critical; maybe just log and continue?
-" || log_error "Failed to ensure WebDAV backup directory exists. Check connection and permissions."
-    else
-        FULL_WEBDAV_URL="${WEBDAV_URL}"
-        log "Using root WebDAV URL for backups: ${FULL_WEBDAV_URL}"
+        # 确保子目录路径没有前导斜杠
+        WEBDAV_BACKUP_PATH_CLEAN=${WEBDAV_BACKUP_PATH#/}
+        FULL_WEBDAV_URL="${WEBDAV_URL_BASE}/${WEBDAV_BACKUP_PATH_CLEAN}"
     fi
-    log "Full WebDAV backup URL: ${FULL_WEBDAV_URL}"
+    echo "WebDAV 完整路径: ${FULL_WEBDAV_URL}"
 
-    # --- Restore Function ---
+    # 下载最新备份并恢复函数
     restore_backup() {
-        log "Attempting to restore latest backup from WebDAV..."
-        local latest_backup_file
-        local local_tmp_path
-        local temp_extract_dir="${TMP_DIR}/oneapi_restore_temp"
-
-        # Use Python to find the latest backup and download it
-        restore_script_output=$(python3 -c "
-import sys, os, tarfile, requests, shutil
+        echo "开始尝试从 WebDAV 下载并恢复最新备份..."
+        python3 -c "
+import sys
+import os
+import tarfile
+import requests
 from webdav3.client import Client
-from urllib.parse import urljoin
+import shutil
+
+# 从环境变量获取配置
+webdav_url = '$FULL_WEBDAV_URL'
+webdav_user = '$WEBDAV_USERNAME'
+webdav_pass = '$WEBDAV_PASSWORD'
+db_filename = '$DB_FILENAME'
+backup_prefix = '$BACKUP_PREFIX'
+local_db_path = '$DB_FILE_PATH' # 恢复的目标路径
+tmp_dir = '$TMP_DIR/restore_$$' # 唯一的临时解压目录
+tmp_download_dir = '$TMP_DIR' # 下载文件存放目录
 
 options = {
-    'webdav_hostname': '$FULL_WEBDAV_URL',
-    'webdav_login': '$WEBDAV_USERNAME',
-    'webdav_password': '$WEBDAV_PASSWORD',
-    'verify_ssl': os.environ.get('WEBDAV_VERIFY_SSL', 'true').lower() == 'true'
+    'webdav_hostname': webdav_url,
+    'webdav_login': webdav_user,
+    'webdav_password': webdav_pass
 }
-target_db_path = '$DB_FILE_PATH'
-backup_prefix = '$BACKUP_PREFIX'
-tmp_dir = '$TMP_DIR'
-temp_extract_dir = '$temp_extract_dir'
 
 try:
     client = Client(options)
-    files_info = client.list(get_info=True)
-    backups = sorted([
-        info['name'] for info in files_info
-        if info['name'].endswith('.tar.gz') and info['name'].startswith(backup_prefix)
-    ])
+    # 尝试创建远程目录（如果不存在），忽略 'Method Not Allowed' (目录已存在) 或类似错误
+    try:
+        # webdavclient3 的 mkdir 需要相对路径（相对于 hostname）
+        relative_path = webdav_url.replace(client.options.get('webdav_root', ''), '', 1)
+        if not relative_path.startswith('/'): relative_path = '/' + relative_path # 确保有根
+        client.mkdir(relative_path)
+        print(f'尝试创建/确认 WebDAV 目录 {relative_path} 存在')
+    except Exception as mkdir_err:
+        # 常见的目录已存在错误码可能不同，这里简单忽略一些已知情况
+        if '405' not in str(mkdir_err) and 'exists' not in str(mkdir_err).lower():
+             print(f'警告：创建 WebDAV 目录时发生非预期错误: {mkdir_err}')
+
+    # 列出 WebDAV 目录中的所有文件/目录
+    remote_items = client.list()
+    # print(f'DEBUG: Remote items: {remote_items}') # 调试时取消注释
+
+    # 筛选出符合条件的备份文件（.tar.gz 结尾且前缀匹配）
+    # client.list() 返回的可能是 基础URL后的相对路径 或 完整URL，需要处理
+    backups = []
+    for item in remote_items:
+         basename = os.path.basename(item.rstrip('/')) # 获取文件名
+         if basename.endswith('.tar.gz') and basename.startswith(backup_prefix):
+             # 存储完整路径或相对路径，取决于 client.list() 返回什么
+             # 假设返回的是相对路径，需要拼接才能下载
+             backups.append(item)
 
     if not backups:
-        print('INFO: No backups found matching prefix {backup_prefix}*.tar.gz in {options['webdav_hostname']}. Skipping restore.', file=sys.stderr)
-        sys.exit(0)
+        print('在 WebDAV 上没有找到符合条件的备份文件，跳过恢复。')
+        sys.exit(0) # 正常退出，不执行恢复
 
-    latest_backup = backups[-1]
-    remote_backup_path = latest_backup # Relative path from client's perspective
-    # Construct full URL for requests, handling potential double slashes carefully
-    backup_file_url = urljoin(options['webdav_hostname'].strip('/') + '/', remote_backup_path.strip('/'))
-    local_tmp_path = os.path.join(tmp_dir, os.path.basename(latest_backup))
+    # 按文件名排序找到最新的备份
+    backups.sort(key=lambda x: os.path.basename(x.rstrip('/')))
+    latest_backup_path = backups[-1] # list返回的路径
+    latest_backup_basename = os.path.basename(latest_backup_path.rstrip('/'))
+    print(f'找到最新备份文件: {latest_backup_basename}')
 
-    print(f'INFO: Found latest backup: {latest_backup}. Downloading from {backup_file_url}...', file=sys.stderr)
-    with requests.get(backup_file_url, auth=(options['webdav_login'], options['webdav_password']), stream=True, verify=options['verify_ssl']) as r:
-        r.raise_for_status()
-        with open(local_tmp_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-    print(f'INFO: Successfully downloaded backup to {local_tmp_path}', file=sys.stderr)
+    # 构建完整的下载 URL
+    # 确保 URL 基础部分没有尾部斜杠，路径部分没有前导斜杠
+    download_url = options['webdav_hostname'].rstrip('/') + '/' + latest_backup_path.lstrip('/')
+    local_tmp_download_path = os.path.join(tmp_download_dir, latest_backup_basename)
 
-    if os.path.exists(local_tmp_path):
-        if os.path.exists(temp_extract_dir): shutil.rmtree(temp_extract_dir)
-        os.makedirs(temp_extract_dir, exist_ok=True)
+    # 下载备份文件
+    print(f'开始下载: {download_url} -> {local_tmp_download_path}')
+    try:
+        with requests.get(download_url, auth=(options['webdav_login'], options['webdav_password']), stream=True, timeout=300) as r:
+            r.raise_for_status() # 如果状态码不是 2xx，则抛出 HTTPError
+            with open(local_tmp_download_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f'成功下载备份文件到 {local_tmp_download_path}')
+    except requests.exceptions.RequestException as download_err:
+         print(f'下载备份文件时出错: {download_err}')
+         sys.exit(1) # 下载失败，异常退出
 
-        print(f'INFO: Extracting {local_tmp_path} to {temp_extract_dir}...', file=sys.stderr)
+    # 解压并恢复数据库文件
+    if os.path.exists(local_tmp_download_path):
         try:
-            with tarfile.open(local_tmp_path, 'r:gz') as tar:
-                # Basic check for safe paths (relative, within extract dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+            print(f'开始解压 {local_tmp_download_path} 到 {tmp_dir}')
+            with tarfile.open(local_tmp_download_path, 'r:gz') as tar:
+                # 安全解压，防止路径遍历攻击
+                def is_within_directory(directory, target):
+                    abs_directory = os.path.abspath(directory)
+                    abs_target = os.path.abspath(target)
+                    prefix = os.path.commonprefix([abs_directory, abs_target])
+                    return prefix == abs_directory
+
                 for member in tar.getmembers():
-                    if member.name.startswith('/') or '..' in member.name:
-                        raise ValueError(f'Unsafe path found in tar: {member.name}')
-                tar.extractall(path=temp_extract_dir)
+                    member_path = os.path.join(tmp_dir, member.name)
+                    if not is_within_directory(tmp_dir, member_path):
+                        raise Exception(f'检测到不安全的解压路径: {member.name}')
+                tar.extractall(path=tmp_dir)
 
-            # Find 'one-api.db' within the extracted files
-            found_db_path = None
-            db_filename = os.path.basename(target_db_path) # Should be 'one-api.db'
-            for root, dirs, files in os.walk(temp_extract_dir):
-                if db_filename in files:
-                    found_db_path = os.path.join(root, db_filename)
-                    print(f'INFO: Found {db_filename} at {found_db_path}', file=sys.stderr)
-                    break
-
-            if found_db_path:
-                print(f'INFO: Restoring {found_db_path} to {target_db_path}...', file=sys.stderr)
-                os.makedirs(os.path.dirname(target_db_path), exist_ok=True)
-                os.replace(found_db_path, target_db_path) # Atomic replace if possible
-                print(f'INFO: Successfully restored database from {latest_backup}.', file=sys.stderr)
-                # Output the path for bash script confirmation
-                print(f'{local_tmp_path}')
+            # 查找解压后的数据库文件 (应该就在解压根目录)
+            extracted_db_path = os.path.join(tmp_dir, db_filename)
+            if os.path.isfile(extracted_db_path):
+                print(f'在解压目录中找到 {db_filename}')
+                # 确保目标目录存在
+                os.makedirs(os.path.dirname(local_db_path), exist_ok=True)
+                # 移动（覆盖）数据库文件
+                shutil.move(extracted_db_path, local_db_path)
+                print(f'成功从 {latest_backup_basename} 恢复 {db_filename} 到 {local_db_path}')
             else:
-                print(f'ERROR: Could not find {db_filename} in the extracted backup {latest_backup}.', file=sys.stderr)
+                print(f'错误：在解压后的备份文件 {tmp_dir} 中未找到 {db_filename}。')
+                # 可选：检查是否存在旧格式 (如 data/one-api.db)，如果需要兼容
+                # old_format_path = os.path.join(tmp_dir, 'data', db_filename)
+                # if os.path.isfile(old_format_path): ...
 
-        except (tarfile.TarError, ValueError, Exception) as e:
-            print(f'ERROR: Failed to extract or process backup file {local_tmp_path}: {e}', file=sys.stderr)
+        except (tarfile.TarError, OSError, Exception) as extract_err:
+             print(f'解压或恢复数据库时出错: {extract_err}')
         finally:
-            if os.path.exists(temp_extract_dir): shutil.rmtree(temp_extract_dir)
-            if os.path.exists(local_tmp_path) and found_db_path is None: # Clean up tmp if restore failed finding db
-                 os.remove(local_tmp_path)
-            elif found_db_path is None: # No file downloaded or other error
-                 pass # Keep the tmp file path empty if download failed
+            # 清理下载的压缩包和解压目录
+            print(f'清理临时文件: {local_tmp_download_path}')
+            os.remove(local_tmp_download_path)
+            if os.path.exists(tmp_dir):
+                 print(f'清理临时目录: {tmp_dir}')
+                 shutil.rmtree(tmp_dir)
     else:
-        print(f'ERROR: Downloaded backup file {local_tmp_path} does not exist.', file=sys.stderr)
+        print(f'错误：下载的备份文件 {local_tmp_download_path} 未找到。')
 
-except requests.exceptions.RequestException as e:
-    print(f'ERROR: WebDAV request failed during restore: {e}', file=sys.stderr)
 except Exception as e:
-    print(f'ERROR: Unexpected error during restore preparation: {e}', file=sys.stderr)
-
-" 2>&1) # Capture stdout and stderr
-
-        # Check if Python script outputted a path (indicating download success)
-        local_tmp_path=$(echo "$restore_script_output" | grep "^${TMP_DIR}/" | tail -n 1)
-        # Log Python script's stderr messages
-        echo "$restore_script_output" | grep -v "^${TMP_DIR}/" | while IFS= read -r line; do log "$line"; done
-
-        # Clean up the downloaded tar.gz file if it exists
-        if [[ -n "$local_tmp_path" && -f "$local_tmp_path" ]]; then
-            rm -f "$local_tmp_path"
-            log "Cleaned up temporary downloaded file: $local_tmp_path"
-        fi
-        # Always remove the temp extraction dir if it exists
-        if [ -d "$temp_extract_dir" ]; then
-             rm -rf "$temp_extract_dir"
-             log "Cleaned up temporary extraction directory: $temp_extract_dir"
+    print(f'执行恢复备份过程中发生意外错误: {e}')
+    # 即使恢复失败，也允许主程序继续启动，可能使用空的或旧的数据库
+"
+        # 检查 Python 脚本的退出码
+        if [ $? -ne 0 ]; then
+             echo "警告：恢复备份脚本执行失败。"
         fi
     }
 
-    # --- Sync Function (runs in background) ---
+    # 首次启动时尝试恢复最新备份
+    restore_backup
+
+    # 后台定期同步函数
     sync_data() {
-        local initial_delay=${INITIAL_SYNC_DELAY:-30} # Delay before first sync check (seconds)
-        log "Sync process starting. Initial check delay: ${initial_delay}s."
-        sleep "$initial_delay"
+        local keep_latest_backups=5 # 保留最新的备份数量
 
         while true; do
-            local sync_interval=${SYNC_INTERVAL:-600} # Interval between sync checks (seconds)
-            log "Starting periodic sync check..."
+            # 获取同步间隔，默认 600 秒 (10 分钟)
+            SYNC_INTERVAL=${SYNC_INTERVAL:-600}
+            echo "同步检查开始: $(date)"
 
-            if [ ! -f "$DB_FILE_PATH" ]; then
-                log "Database file $DB_FILE_PATH not found. Skipping backup cycle."
-            else
-                # Calculate checksum (use md5sum or sha256sum)
-                local current_checksum
-                if command -v md5sum >/dev/null; then
-                    current_checksum=$(md5sum "$DB_FILE_PATH" | awk '{ print $1 }')
-                elif command -v sha256sum >/dev/null; then
-                     current_checksum=$(sha256sum "$DB_FILE_PATH" | awk '{ print $1 }')
+            # 检查数据库文件是否存在
+            if [ -f "$DB_FILE_PATH" ]; then
+                timestamp=$(date +%Y%m%d_%H%M%S)
+                backup_basename="${BACKUP_PREFIX}${timestamp}.tar.gz"
+                local_tmp_backup_path="${TMP_DIR}/${backup_basename}"
+
+                echo "找到数据库文件: ${DB_FILE_PATH}"
+                echo "创建本地临时备份: ${local_tmp_backup_path}"
+                # 使用 tar 打包，-C 指定源目录，只包含文件名
+                tar -czf "${local_tmp_backup_path}" -C "${DATA_DIR}" "${DB_FILENAME}"
+                if [ $? -ne 0 ]; then
+                     echo "错误：创建 tar 压缩文件失败。"
+                     # 失败后也需要等待，避免高频重试
+                     echo "下次同步检查将在 ${SYNC_INTERVAL} 秒后进行..."
+                     sleep $SYNC_INTERVAL
+                     continue # 跳过本次循环的后续步骤
+                fi
+
+                # 上传新备份到 WebDAV
+                echo "准备上传备份: ${backup_basename}"
+                # 确保 URL 尾部有斜杠，文件名不以斜杠开头
+                upload_url="${FULL_WEBDAV_URL%/}/${backup_basename}"
+                echo "上传至: ${upload_url}"
+                # 使用 curl 上传，-T 指定文件，-u 提供认证信息
+                # --fail: HTTP 错误时返回非零退出码
+                # -s: 静默模式
+                # -o /dev/null: 丢弃服务器响应体
+                # --connect-timeout 10: 连接超时10秒
+                # --max-time 300: 最大传输时间300秒
+                curl -u "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" -T "${local_tmp_backup_path}" "${upload_url}" --fail -s -o /dev/null --connect-timeout 10 --max-time 300
+                upload_status=$?
+
+                if [ ${upload_status} -eq 0 ]; then
+                    echo "成功将 ${backup_basename} 上传至 WebDAV"
                 else
-                    log_error "Neither md5sum nor sha256sum found. Cannot perform checksum comparison. Backing up unconditionally."
-                    current_checksum="" # Force backup
+                    echo "上传 ${backup_basename} 至 WebDAV 失败 (curl 退出码: ${upload_status})"
+                    # 上传失败不删除本地临时文件，以便排查
                 fi
 
-                local last_checksum=""
-                if [ -f "$CHECKSUM_FILE" ]; then
-                    last_checksum=$(cat "$CHECKSUM_FILE")
-                fi
-
-                if [ "$current_checksum" != "$last_checksum" ] || [ -z "$last_checksum" ] ; then # Backup if changed or first time
-                    if [ "$current_checksum" != "$last_checksum" ]; then
-                         log "Database file $DB_FILE_PATH has changed (Checksum: ${current_checksum:0:8}...). Proceeding with backup."
-                    else
-                         log "No previous checksum found. Proceeding with initial backup."
-                    fi
-
-                    local timestamp=$(date +%Y%m%d_%H%M%S)
-                    local backup_file="${BACKUP_PREFIX}${timestamp}.tar.gz"
-                    local local_tmp_backup_path="${TMP_DIR}/${backup_file}"
-
-                    log "Creating backup archive: $local_tmp_backup_path"
-                    # Tar options: -C changes directory before adding files
-                    if tar -czf "$local_tmp_backup_path" -C "$(dirname "$DB_FILE_PATH")" "$(basename "$DB_FILE_PATH")"; then
-                        log "Backup archive created successfully."
-                        local upload_url="${FULL_WEBDAV_URL}/${backup_file}"
-                        log "Uploading ${backup_file} to ${FULL_WEBDAV_URL} ..."
-
-                        # Use curl for upload, handle SSL verification via env var
-                        local curl_opts=("-u" "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "-T" "$local_tmp_backup_path")
-                        if [[ "${WEBDAV_VERIFY_SSL:-true}" != "true" ]]; then
-                             curl_opts+=("-k") # Add insecure flag if verification is disabled
-                             log "Warning: WEBDAV_VERIFY_SSL is not 'true'. Disabling SSL verification for upload."
-                        fi
-
-                        if curl "${curl_opts[@]}" "$upload_url"; then
-                            log "Successfully uploaded ${backup_file} to WebDAV."
-                            # Update checksum file on successful upload
-                            echo "$current_checksum" > "$CHECKSUM_FILE"
-
-                            # --- Cleanup Old Backups ---
-                            local keep_latest=${WEBDAV_KEEP_LATEST:-5} # Number of backups to keep
-                            log "Cleaning up old backups on WebDAV, keeping latest ${keep_latest}..."
-                            cleanup_output=$(python3 -c "
-import sys, os
+                # 清理 WebDAV 上的旧备份文件
+                echo "开始清理 WebDAV 上的旧备份 (保留最新的 ${keep_latest_backups} 个)..."
+                python3 -c "
+import sys
+import os
 from webdav3.client import Client
-options = {
-    'webdav_hostname': '$FULL_WEBDAV_URL',
-    'webdav_login': '$WEBDAV_USERNAME',
-    'webdav_password': '$WEBDAV_PASSWORD',
-    'verify_ssl': os.environ.get('WEBDAV_VERIFY_SSL', 'true').lower() == 'true'
-}
-keep_latest = int('$keep_latest')
+
+# 从环境变量获取配置
+webdav_url = '$FULL_WEBDAV_URL'
+webdav_user = '$WEBDAV_USERNAME'
+webdav_pass = '$WEBDAV_PASSWORD'
 backup_prefix = '$BACKUP_PREFIX'
+keep_latest = $keep_latest_backups
+
+options = {
+    'webdav_hostname': webdav_url,
+    'webdav_login': webdav_user,
+    'webdav_password': webdav_pass
+}
+
 try:
     client = Client(options)
-    files_info = client.list(get_info=True)
-    backups = sorted([
-        info['name'] for info in files_info
-        if info['name'].endswith('.tar.gz') and info['name'].startswith(backup_prefix)
-    ])
+    remote_items = client.list()
+    # print(f'DEBUG: Remote items before cleanup: {remote_items}') # 调试时取消注释
 
+    # 筛选备份文件
+    backups = []
+    for item in remote_items:
+        basename = os.path.basename(item.rstrip('/'))
+        if basename.endswith('.tar.gz') and basename.startswith(backup_prefix):
+             # 假设 client.list() 返回的是相对路径或带 hostname 的路径
+             # 需要从路径中提取用于删除的部分，通常是 hostname 之后的部分
+             relative_path = item.replace(client.options.get('webdav_root',''), '', 1).lstrip('/')
+             backups.append(relative_path) # 存储用于排序和删除的相对路径
+
+    if not backups:
+        print('未找到需要清理的备份文件。')
+        sys.exit(0)
+
+    # 按文件名（时间戳）排序
+    backups.sort()
+
+    print(f'找到 {len(backups)} 个备份文件。')
     if len(backups) > keep_latest:
         to_delete_count = len(backups) - keep_latest
-        print(f'Found {len(backups)} backups. Deleting {to_delete_count} oldest backups...', file=sys.stderr)
+        print(f'需要删除 {to_delete_count} 个旧备份。')
+        files_to_delete = backups[:to_delete_count]
         deleted_count = 0
-        for file_rel_path in backups[:to_delete_count]:
+        for file_path in files_to_delete:
             try:
-                print(f'Deleting {file_rel_path}...', file=sys.stderr)
-                client.clean(file_rel_path) # clean likely takes relative path
+                # 使用 client.clean 删除，需要相对路径
+                client.clean(file_path)
+                print(f'成功删除旧备份: {os.path.basename(file_path)}')
                 deleted_count += 1
-            except Exception as e:
-                print(f'Failed to delete {file_rel_path}: {e}', file=sys.stderr)
-        print(f'Successfully deleted {deleted_count} old backups.', file=sys.stderr)
+            except Exception as delete_err:
+                print(f'删除旧备份 {os.path.basename(file_path)} 时出错: {delete_err}')
+        print(f'实际删除 {deleted_count} 个旧备份。')
     else:
-        print(f'Found {len(backups)} backups. No cleanup needed (keeping {keep_latest}).', file=sys.stderr)
+        print(f'备份数量 ({len(backups)}) 未超过限制 ({keep_latest})，无需清理。')
+
 except Exception as e:
-    print(f'Error during WebDAV cleanup: {e}', file=sys.stderr)
-" 2>&1) # Capture stdout and stderr
-                            # Log Python cleanup script's stderr messages
-                            echo "$cleanup_output" | while IFS= read -r line; do log "$line"; done
+    print(f'清理旧备份时发生意外错误: {e}')
+" # Python 清理脚本结束
 
-                        else
-                            log_error "Failed to upload ${backup_file} to WebDAV (curl exit code: $?)."
-                        fi
-
-                        # Clean up local temporary backup file regardless of upload status? Yes.
-                        rm -f "$local_tmp_backup_path"
-                        log "Cleaned up local temporary backup file: $local_tmp_backup_path"
-
-                    else
-                        log_error "Failed to create backup archive $local_tmp_backup_path."
-                    fi
-                else
-                    log "Database file $DB_FILE_PATH unchanged (Checksum: ${current_checksum:0:8}...). Skipping backup."
-                fi
+                # 清理本地临时备份文件（无论上传是否成功，只要 tar 创建成功就清理）
+                echo "清理本地临时备份文件: ${local_tmp_backup_path}"
+                rm -f "${local_tmp_backup_path}"
+            else
+                echo "数据库文件 ${DB_FILE_PATH} 不存在，跳过本次备份。"
             fi
 
-            log "Sync check finished. Next check in ${sync_interval} seconds."
-            sleep "$sync_interval"
+            echo "下次同步检查将在 ${SYNC_INTERVAL} 秒后进行..."
+            sleep $SYNC_INTERVAL
         done
     }
 
-    # --- Initial Restore (Optional) ---
-    if [[ "${RECOVERY_ON_START:-false}" == "true" ]]; then
-        log "RECOVERY_ON_START is true. Attempting initial restore..."
-        restore_backup
-    else
-        log "RECOVERY_ON_START is not 'true'. Skipping initial restore."
-    fi
-
-    # --- Start Background Sync Process ---
-    log "Starting background sync process..."
+    # 后台启动同步进程
+    echo "在后台启动定期备份进程..."
     sync_data &
-    SYNC_PID=$!
-    log "Background sync process started with PID: $SYNC_PID"
+    sync_pid=$!
+    echo "备份进程 PID: ${sync_pid}"
 
-    # Trap TERM and INT signals to gracefully shut down background process if possible
-    trap 'log "Received termination signal. Killing sync process $SYNC_PID..."; kill $SYNC_PID; wait $SYNC_PID 2>/dev/null; log "Sync process terminated."; exit 0' TERM INT
+fi # 结束 WebDAV 配置检查
 
-fi # End of WEBDAV_ENABLED check
-
-# --- Start Main Application ---
-log "Starting one-api application..."
-# Use exec to replace the shell process with the main application
-# Pass any arguments received by this script to the main application
+# 启动主应用程序
+echo "启动主程序: /one-api $@"
+# 使用 exec 将 shell 替换为 one-api 进程
+# "$@" 将传递给 entrypoint.sh 的所有参数原样传递给 one-api
 exec /one-api "$@"
 
-# Fallback exit if exec fails for some reason
-exit $?
+# exec 后面的代码不会执行
+echo "如果看到此消息，则 exec /one-api 失败！"
+exit 1
