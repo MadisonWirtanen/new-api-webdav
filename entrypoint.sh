@@ -89,7 +89,7 @@ sync_data() {
                 if [ ! -z "$WEBDAV_URL" ] && [ ! -z "$WEBDAV_USERNAME" ] && [ ! -z "$WEBDAV_PASSWORD" ]; then
                     echo "[同步] 上传 ${current_db_file} 到 WebDAV..."
                     # 使用 curl 上传当前目录下的文件
-                    if curl -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"; then
+                    if curl --connect-timeout 15 -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"; then
                         echo "[同步] WebDAV更新成功"
                         # 更新校验和文件
                         mv "$current_sum_new_file" "$current_sum_file"
@@ -103,7 +103,7 @@ sync_data() {
 
                             # WebDAV 每日备份
                             echo "[同步] 备份 ${FILENAME_DAILY} 到 WebDAV..."
-                            if curl -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME_DAILY"; then
+                            if curl --connect-timeout 15 -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/$FILENAME_DAILY"; then
                                 echo "[同步] WebDAV日期备份成功: $FILENAME_DAILY"
 
                                 # GitHub 每日备份 (如果配置了)
@@ -150,8 +150,8 @@ sync_data() {
                         fi # end daily backup time check
                     else # webdav upload failed
                         echo "[同步] WebDAV上传失败, 尝试重试..."
-                        sleep 10
-                        if curl -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"; then
+                        sleep 20
+                        if curl --connect-timeout 15 -L -T "$current_db_file" --user "$WEBDAV_USERNAME:$WEBDAV_PASSWORD" "$WEBDAV_URL/${BACKUP_FILENAME_PREFIX}.${BACKUP_FILE_EXTENSION}"; then
                             echo "[同步] WebDAV重试更新成功"
                             # 更新校验和文件
                             mv "$current_sum_new_file" "$current_sum_file"
