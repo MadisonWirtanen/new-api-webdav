@@ -20,7 +20,8 @@ RUN go build -ldflags "-s -w -X 'one-api/common.Version=$(cat VERSION)'" -o one-
 FROM alpine
 RUN apk update
 RUN apk upgrade
-RUN apk add --no-cache ca-certificates tzdata ffmpeg bash curl git coreutils python3.8 python3-pip tar
+RUN apk add --no-cache ca-certificates tzdata ffmpeg bash curl git coreutils python3 py3-pip py3-requests tar
+RUN apk add --no-cache python3.8 python3-pip
 RUN pip3 install --no-cache-dir webdavclient3 requests
 RUN update-ca-certificates
 RUN rm -rf /var/cache/apk/* /tmp/*
