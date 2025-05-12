@@ -21,10 +21,10 @@ FROM alpine
 RUN apk update \
     && apk upgrade \
     && apk add --no-cache ca-certificates tzdata ffmpeg \
-           bash curl git coreutils python3 py3-pip py3-requests tar \
-    && pip3 install webdavclient3 \
+           bash curl git coreutils python3 python3-pip tar \
     && update-ca-certificates \
     && rm -rf /var/cache/apk/* /tmp/*
+RUN pip3 install --no-cache-dir webdavclient3 requests
 
 COPY --from=builder2 /build/one-api /one-api
 
