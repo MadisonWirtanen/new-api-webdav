@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # --- 配置 START ---
-# 数据库文件路径和名称 (根据您的应用调整，这里仿照示例使用 webui.db)
-DB_FILE_PATH="/data/webui.db" # 您的应用数据库在容器内的完整路径
-DB_FILE_NAME="webui.db"       # 仅数据库文件名
-BACKUP_FILE_PREFIX="webui_backup_" # WebDAV上备份文件的前缀
+# 数据库文件路径和名称 (根据您的应用调整，这里仿照示例使用 one-api.db)
+DB_FILE_PATH="/data/one-api.db" # 您的应用数据库在容器内的完整路径
+DB_FILE_NAME="one-api.db"       # 仅数据库文件名
+BACKUP_FILE_PREFIX="one-api_backup_" # WebDAV上备份文件的前缀
 MAX_BACKUPS_TO_KEEP=5         # 在WebDAV上保留的最大备份数量
 # --- 配置 END ---
 
@@ -43,9 +43,9 @@ import shutil
 webdav_hostname = '$FULL_WEBDAV_URL'
 webdav_login = '$WEBDAV_USERNAME'
 webdav_password = '$WEBDAV_PASSWORD'
-target_db_full_path = '$DB_FILE_PATH' # 恢复后数据库的最终完整路径, e.g., /data/webui.db
-db_file_name_in_tar = '$DB_FILE_NAME' # 在 tar 包中要查找的文件名, e.g., webui.db
-backup_prefix = '$BACKUP_FILE_PREFIX' # e.g., webui_backup_
+target_db_full_path = '$DB_FILE_PATH' # 恢复后数据库的最终完整路径, e.g., /data/one-api.db
+db_file_name_in_tar = '$DB_FILE_NAME' # 在 tar 包中要查找的文件名, e.g., one-api.db
+backup_prefix = '$BACKUP_FILE_PREFIX' # e.g., one-api_backup_
 
 options = {
     'webdav_hostname': webdav_hostname,
