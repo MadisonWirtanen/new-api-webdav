@@ -22,7 +22,7 @@ RUN apk update \
     && apk upgrade \
     && apk add --no-cache ca-certificates tzdata ffmpeg \
            bash curl git coreutils python3 py3-pip py3-requests tar \
-    && pip install --no-cache-dir webdavclient3 \
+    && pip install webdavclient3 \
     && update-ca-certificates \
     && rm -rf /var/cache/apk/* /tmp/*
 
