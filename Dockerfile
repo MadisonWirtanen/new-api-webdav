@@ -17,12 +17,14 @@ COPY . .
 COPY --from=builder /build/dist ./web/dist
 RUN go build -ldflags "-s -w -X 'one-api/common.Version=$(cat VERSION)'" -o one-api
 
-FROM alpine
+FROM python:3.10-alpine
 RUN apk update
 RUN apk upgrade
-RUN apk add --no-cache ca-certificates tzdata ffmpeg bash curl git coreutils python3 py3-pip py3-requests tar
+RUN apk add --no-cache ca-certificates tzdata ffmpeg bash curl git coreutils tar libxml2 libxslt
+RUN apk add --no-cache --virtual .build-deps build-base libxml2-dev libxslt-dev
 RUN pip3 install --no-cache-dir webdavclient3 requests
 RUN update-ca-certificates
+RUN apk del .build-deps
 RUN rm -rf /var/cache/apk/* /tmp/*
 
 COPY --from=builder2 /build/one-api /one-api
