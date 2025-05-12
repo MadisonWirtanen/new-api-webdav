@@ -5,7 +5,7 @@
 DB_FILE_PATH="/data/one-api.db" # 您的应用数据库在容器内的完整路径
 DB_FILE_NAME="one-api.db"       # 仅数据库文件名
 BACKUP_FILE_PREFIX="one-api_backup_" # WebDAV上备份文件的前缀
-MAX_BACKUPS_TO_KEEP=5         # 在WebDAV上保留的最大备份数量
+MAX_BACKUPS_TO_KEEP=14         # 在WebDAV上保留的最大备份数量
 # --- 配置 END ---
 
 # 检查核心 WebDAV 环境变量
