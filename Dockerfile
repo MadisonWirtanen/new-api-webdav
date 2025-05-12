@@ -21,7 +21,7 @@ FROM alpine
 RUN apk update \
     && apk upgrade \
     && apk add --no-cache ca-certificates tzdata ffmpeg \
-           bash curl git coreutils python3 python3-pip tar \
+           bash curl git coreutils python3.8 python3-pip tar \
     && update-ca-certificates \
     && rm -rf /var/cache/apk/* /tmp/*
 RUN pip3 install --no-cache-dir webdavclient3 requests
