@@ -18,13 +18,11 @@ COPY --from=builder /build/dist ./web/dist
 RUN go build -ldflags "-s -w -X 'one-api/common.Version=$(cat VERSION)'" -o one-api
 
 FROM alpine
-RUN apk update \
-    && apk upgrade \
-    && apk add --no-cache ca-certificates tzdata ffmpeg \
-           bash curl git coreutils python3 py3-pip py3-requests tar \
-    && pip3 install --no-cache-dir webdavclient3 \
-    && update-ca-certificates \
-    && rm -rf /var/cache/apk/*
+RUN apk update && apk upgrade
+RUN apk add --no-cache ca-certificates tzdata ffmpeg bash curl git coreutils python3 py3-pip py3-requests tar
+RUN pip3 install --no-cache-dir webdavclient3
+RUN update-ca-certificates
+RUN rm -rf /var/cache/apk/* /tmp/*
 
 COPY --from=builder2 /build/one-api /one-api
 
